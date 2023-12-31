@@ -1,0 +1,290 @@
+# type: ignore
+import asyncio
+from contextlib import suppress
+from typing import Any
+from unittest import mock
+
+import pytest
+
+from ezyhttp import client, helpers, web
+
+
+async def test_simple_server(ezyhttp_raw_server: Any, ezyhttp_client: Any) -> None:
+    async def handler(request):
+        return web.Response(text=str(request.rel_url))
+
+    server = await ezyhttp_raw_server(handler)
+    cli = await ezyhttp_client(server)
+    resp = await cli.get("/path/to")
+    assert resp.status == 200
+    txt = await resp.text()
+    assert txt == "/path/to"
+
+
+@pytest.mark.xfail(
+    not helpers.NO_EXTENSIONS,
+    raises=client.ServerDisconnectedError,
+    reason="The behavior of C-extensions differs from pure-Python: "
+    "https://github.com/rappitz09/ezyhttp/issues/6446",
+)
+async def test_unsupported_upgrade(ezyhttp_raw_server, ezyhttp_client) -> None:
+    # don't fail if a client probes for an unsupported protocol upgrade
+    # https://github.com/rappitz09/ezyhttp/issues/6446#issuecomment-999032039
+    async def handler(request: web.Request):
+        return web.Response(body=await request.read())
+
+    upgrade_headers = {"Connection": "Upgrade", "Upgrade": "unsupported_proto"}
+    server = await ezyhttp_raw_server(handler)
+    cli = await ezyhttp_client(server)
+    test_data = b"Test"
+    resp = await cli.post("/path/to", data=test_data, headers=upgrade_headers)
+    assert resp.status == 200
+    data = await resp.read()
+    assert data == test_data
+
+
+async def test_raw_server_not_http_exception(
+    ezyhttp_raw_server: Any, ezyhttp_client: Any, loop: Any
+) -> None:
+    # disable debug mode not to print traceback
+    loop.set_debug(False)
+
+    exc = RuntimeError("custom runtime error")
+
+    async def handler(request):
+        raise exc
+
+    logger = mock.Mock()
+    server = await ezyhttp_raw_server(handler, logger=logger)
+    cli = await ezyhttp_client(server)
+    resp = await cli.get("/path/to")
+    assert resp.status == 500
+    assert resp.headers["Content-Type"].startswith("text/plain")
+
+    txt = await resp.text()
+    assert txt.startswith("500 Internal Server Error")
+    assert "Traceback" not in txt
+
+    logger.exception.assert_called_with("Error handling request", exc_info=exc)
+
+
+async def test_raw_server_handler_timeout(
+    ezyhttp_raw_server: Any, ezyhttp_client: Any
+) -> None:
+    loop = asyncio.get_event_loop()
+    loop.set_debug(True)
+    exc = asyncio.TimeoutError("error")
+
+    async def handler(request):
+        raise exc
+
+    logger = mock.Mock()
+    server = await ezyhttp_raw_server(handler, logger=logger)
+    cli = await ezyhttp_client(server)
+    resp = await cli.get("/path/to")
+    assert resp.status == 504
+
+    await resp.text()
+    logger.debug.assert_called_with("Request handler timed out.", exc_info=exc)
+
+
+async def test_raw_server_do_not_swallow_exceptions(
+    ezyhttp_raw_server: Any, ezyhttp_client: Any
+) -> None:
+    async def handler(request):
+        raise asyncio.CancelledError()
+
+    loop = asyncio.get_event_loop()
+    loop.set_debug(True)
+    logger = mock.Mock()
+    server = await ezyhttp_raw_server(handler, logger=logger)
+    cli = await ezyhttp_client(server)
+
+    with pytest.raises(client.ServerDisconnectedError):
+        await cli.get("/path/to")
+
+    logger.debug.assert_called_with("Ignored premature client disconnection")
+
+
+async def test_raw_server_cancelled_in_write_eof(
+    ezyhttp_raw_server: Any, ezyhttp_client: Any
+):
+    class MyResponse(web.Response):
+        async def write_eof(self, data=b""):
+            raise asyncio.CancelledError("error")
+
+    async def handler(request):
+        resp = MyResponse(text=str(request.rel_url))
+        return resp
+
+    loop = asyncio.get_event_loop()
+    loop.set_debug(True)
+    logger = mock.Mock()
+    server = await ezyhttp_raw_server(handler, logger=logger)
+    cli = await ezyhttp_client(server)
+
+    resp = await cli.get("/path/to")
+    with pytest.raises(client.ClientPayloadError):
+        await resp.read()
+
+    logger.debug.assert_called_with("Ignored premature client disconnection")
+
+
+async def test_raw_server_not_http_exception_debug(
+    ezyhttp_raw_server: Any, ezyhttp_client: Any
+) -> None:
+    exc = RuntimeError("custom runtime error")
+
+    async def handler(request):
+        raise exc
+
+    loop = asyncio.get_event_loop()
+    loop.set_debug(True)
+    logger = mock.Mock()
+    server = await ezyhttp_raw_server(handler, logger=logger)
+    cli = await ezyhttp_client(server)
+    resp = await cli.get("/path/to")
+    assert resp.status == 500
+    assert resp.headers["Content-Type"].startswith("text/plain")
+
+    txt = await resp.text()
+    assert "Traceback (most recent call last):\n" in txt
+
+    logger.exception.assert_called_with("Error handling request", exc_info=exc)
+
+
+async def test_raw_server_html_exception(
+    ezyhttp_raw_server: Any, ezyhttp_client: Any, loop: Any
+) -> None:
+    # disable debug mode not to print traceback
+    loop.set_debug(False)
+
+    exc = RuntimeError("custom runtime error")
+
+    async def handler(request):
+        raise exc
+
+    logger = mock.Mock()
+    server = await ezyhttp_raw_server(handler, logger=logger)
+    cli = await ezyhttp_client(server)
+    resp = await cli.get("/path/to", headers={"Accept": "text/html"})
+    assert resp.status == 500
+    assert resp.headers["Content-Type"].startswith("text/html")
+
+    txt = await resp.text()
+    assert txt == (
+        "<html><head><title>500 Internal Server Error</title></head><body>\n"
+        "<h1>500 Internal Server Error</h1>\n"
+        "Server got itself in trouble\n"
+        "</body></html>\n"
+    )
+
+    logger.exception.assert_called_with("Error handling request", exc_info=exc)
+
+
+async def test_raw_server_html_exception_debug(
+    ezyhttp_raw_server: Any, ezyhttp_client: Any
+) -> None:
+    exc = RuntimeError("custom runtime error")
+
+    async def handler(request):
+        raise exc
+
+    loop = asyncio.get_event_loop()
+    loop.set_debug(True)
+    logger = mock.Mock()
+    server = await ezyhttp_raw_server(handler, logger=logger)
+    cli = await ezyhttp_client(server)
+    resp = await cli.get("/path/to", headers={"Accept": "text/html"})
+    assert resp.status == 500
+    assert resp.headers["Content-Type"].startswith("text/html")
+
+    txt = await resp.text()
+    assert txt.startswith(
+        "<html><head><title>500 Internal Server Error</title></head><body>\n"
+        "<h1>500 Internal Server Error</h1>\n"
+        "<h2>Traceback:</h2>\n"
+        "<pre>Traceback (most recent call last):\n"
+    )
+
+    logger.exception.assert_called_with("Error handling request", exc_info=exc)
+
+
+async def test_handler_cancellation(ezyhttp_unused_port) -> None:
+    event = asyncio.Event()
+    port = ezyhttp_unused_port()
+
+    async def on_request(_: web.Request) -> web.Response:
+        nonlocal event
+        try:
+            await asyncio.sleep(10)
+        except asyncio.CancelledError:
+            event.set()
+            raise
+        else:
+            raise web.HTTPInternalServerError()
+
+    app = web.Application()
+    app.router.add_route("GET", "/", on_request)
+
+    runner = web.AppRunner(app, handler_cancellation=True)
+    await runner.setup()
+
+    site = web.TCPSite(runner, host="localhost", port=port)
+
+    await site.start()
+
+    try:
+        assert runner.server.handler_cancellation, "Flag was not propagated"
+
+        async with client.ClientSession(
+            timeout=client.ClientTimeout(total=0.15)
+        ) as sess:
+            with pytest.raises(asyncio.TimeoutError):
+                await sess.get(f"http://localhost:{port}/")
+
+        with suppress(asyncio.TimeoutError):
+            await asyncio.wait_for(event.wait(), timeout=1)
+        assert event.is_set(), "Request handler hasn't been cancelled"
+    finally:
+        await asyncio.gather(runner.shutdown(), site.stop())
+
+
+async def test_no_handler_cancellation(ezyhttp_unused_port) -> None:
+    timeout_event = asyncio.Event()
+    done_event = asyncio.Event()
+    port = ezyhttp_unused_port()
+    started = False
+
+    async def on_request(_: web.Request) -> web.Response:
+        nonlocal done_event, started, timeout_event
+        started = True
+        await asyncio.wait_for(timeout_event.wait(), timeout=5)
+        done_event.set()
+        return web.Response()
+
+    app = web.Application()
+    app.router.add_route("GET", "/", on_request)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+
+    site = web.TCPSite(runner, host="localhost", port=port)
+
+    await site.start()
+
+    try:
+        async with client.ClientSession(
+            timeout=client.ClientTimeout(total=0.2)
+        ) as sess:
+            with pytest.raises(asyncio.TimeoutError):
+                await sess.get(f"http://localhost:{port}/")
+        await asyncio.sleep(0.1)
+        timeout_event.set()
+
+        with suppress(asyncio.TimeoutError):
+            await asyncio.wait_for(done_event.wait(), timeout=1)
+        assert started
+        assert done_event.is_set()
+    finally:
+        await asyncio.gather(runner.shutdown(), site.stop())

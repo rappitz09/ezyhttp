@@ -1,0 +1,21 @@
+include LICENSE.txt
+include CHANGES.rst
+include README.rst
+include CONTRIBUTORS.txt
+include Makefile
+graft ezyhttp
+graft docs
+graft examples
+graft tests
+graft requirements
+recursive-include vendor *
+global-include ezyhttp *.pyi
+global-exclude *.pyc
+global-exclude *.pyd
+global-exclude *.so
+global-exclude *.lib
+global-exclude *.dll
+global-exclude *.a
+global-exclude *.obj
+exclude ezyhttp/*.html
+prune docs/_build
